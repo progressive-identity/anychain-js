@@ -1,5 +1,7 @@
 "use strict";
 
+const tokenMimeType = "text/plain";
+
 const utf8Encoder = new TextEncoder();
 const utf8Decoder = new TextDecoder();
 
@@ -76,40 +78,13 @@ function isDict(o) {
     );
 }
 
-function seedOf(opt, args) {
-    if (args.length < 3) {
-        throw "Anychain.seedOf(rootSeed, length, path, [to, [seed, [...]]])"
-    }
-
-    let seed = args[0];
-    let length = args[1];
-    for (let i=2; i<args.length; ++i) {
-        const isLast = args.length - 1 == i;
-        let key = args[i];
-        let pathH = sodium.crypto_generichash(64, key, opt.key);
-        seed = sodium.crypto_generichash(isLast ? length : 64, seed, opt.key);
-    }
-
-    return seed;
-};
-
-function passwordSeed(pwd, salt) {
-    return sodium.crypto_pwhash(
-        64,
-        pwd,
-        salt,
-        sodium.crypto_pwhash_OPSLIMIT_INTERACTIVE, sodium.crypto_pwhash_MEMLIMIT_INTERACTIVE,
-        sodium.crypto_pwhash_ALG_DEFAULT
-    );
-}
-
 const defaultValidators = {
     [signatureTypeName]: (chain, o) => {
         if (!("signature" in o && "signer" in o && "date" in o && "body" in o)) {
             throw "missing fields";
         }
 
-        // XXX check o.date is a date
+        // XXX check o.date is a timestamp
 
         const hash = chain._fold({
             type: o.type,
@@ -141,6 +116,78 @@ const defaultValidators = {
     },
 };
 
+function _fromJSON(o) {
+    if (o == null) {
+        return null;
+    } else if (Array.isArray(o)) {
+        return o.map(_fromJSON);
+    } else if (typeof(o) == "object") {
+        if (Object.keys(o).length == 1 && typeof(o[uint8ArrayTag]) == 'string') {
+            return sodium.from_base64(o[uint8ArrayTag]);
+
+        } else if (Object.keys(o).length == 1 && typeof(o[hashTag]) == 'string') {
+            return new Hash(sodium.from_base64(o[hashTag]));
+
+        } else if (Object.keys(o).length == 1 && typeof(o[boxTag]) == 'string') {
+            return new Box(sodium.from_base64(o[boxTag]));
+
+        } else {
+            let r = {};
+            for (let k in o) {
+                let v = o[k];
+
+                k = _fromJSON(k);
+                v = _fromJSON(v);
+
+                r[k] = v;
+            }
+
+            return r;
+        }
+    } else {
+        return o;
+    }
+}
+
+function _toJSON(o) {
+    if (o == null) {
+        return null;
+    } else if (Array.isArray(o)) {
+        return o.map(_toJSON);
+    } else if (typeof(o) == "object") {
+        if (o.constructor == Uint8Array) {
+            let r = {};
+            r[uint8ArrayTag] = sodium.to_base64(o);
+            return r;
+
+        } else if (o.constructor == Hash) {
+            let r = {};
+            r[hashTag] = sodium.to_base64(o._raw);
+            return r;
+
+        } else if (o.constructor == Box) {
+            let r = {};
+            r[boxTag] = sodium.to_base64(o._raw);
+            return r;
+
+        } else {
+            let r = {};
+            for (let k in o) {
+                let v = o[k];
+
+                k = _toJSON(k);
+                v = _toJSON(v);
+
+                r[k] = v;
+            }
+
+            return r;
+        }
+    } else {
+        return o;
+    }
+}
+
 class Chain {
     constructor(options) {
         const defaultOptions = {
@@ -159,6 +206,8 @@ class Chain {
         this.ready = sodium.ready;
 
         this.registerValidator(defaultValidators);
+
+        this.tokenMimeType = tokenMimeType;
     }
 
     //// CHAIN VERIFICATION & SAFETY
@@ -173,21 +222,12 @@ class Chain {
         }
     }
 
-    // Check if o has the expectedType and the chain is valid
-    verify(o, expectedType) {
+    verify(o) {
         if (o === undefined) {
             throw "undefined value";
         }
 
-        if (expectedType === undefined) {
-            throw "not expected type defined";
-        }
-
-        if (!(isDict(o) && 'type' in o && o.type == expectedType)) {
-            throw `invalid chain: expected type '${expectedType}', got '${o.type}'`
-        }
-
-        this._verify(o);
+        return this._verify(o);
     }
 
     _verify(o) {
@@ -217,6 +257,8 @@ class Chain {
                 throw `invalid chain: ${e}`;
             }
         }
+
+        return o;
     }
 
     //// CHAIN FOLDING & HASHING
@@ -311,11 +353,10 @@ class Chain {
         if (date === undefined) {
             date = new Date();
         }
-        date = date.toUTCString();
 
         const sig = {
             type: signatureTypeName,
-            date: date,
+            date: +date,
             signer: sk.publicKey,
             body: o,
         };
@@ -324,7 +365,7 @@ class Chain {
         return sig;
     }
 
-    revoke(sk, o) {
+    /*revoke(sk, o) {
         this.verify(o, signatureTypeName);
 
         if (sk.publicKey != o.signer) {
@@ -346,7 +387,7 @@ class Chain {
 
         rev.revocation = sodium.crypto_sign_detached(this._fold(rev), sk.privateKey);
         return rev;
-    }
+    }*/
 
     //// CHAIN ENCRYPTION
 
@@ -365,7 +406,7 @@ class Chain {
         ));
     }
 
-    openSeal(sk, o) {
+    unseal(sk, o) {
         let r = sodium.crypto_box_seal_open(o._raw, sk.publicKey, sk.privateKey);
         r = utf8Decode(r);
         r = JSON.parse(r);
@@ -380,17 +421,17 @@ class Chain {
     }
 
     seedOf(/*rootSeed, length, path, [to, [seed, [...]]]*/) {
-        if (args.length < 3) {
+        if (arguments.length < 3) {
             throw "seedOf(rootSeed, length, path, [to, [seed, [...]]])"
         }
 
-        let seed = args[0];
-        let length = args[1];
-        for (let i=2; i<args.length; ++i) {
-            const isLast = args.length - 1 == i;
-            let key = args[i];
-            let pathH = sodium.crypto_generichash(64, key, opt.key);
-            seed = sodium.crypto_generichash(isLast ? length : 64, seed, opt.key);
+        let seed = arguments[0];
+        let length = arguments[1];
+        for (let i=2; i<arguments.length; ++i) {
+            const isLast = arguments.length - 1 == i;
+            let key = arguments[i];
+            let pathH = sodium.crypto_generichash(64, key, this.options.key);
+            seed = sodium.crypto_generichash(isLast ? length : 64, seed, this.options.key);
         }
 
         return seed;
@@ -408,84 +449,16 @@ class Chain {
 
     //// CHAIN SERIALIZATION & DESERIALIZATION
 
-    _fromJSON(o) {
-        if (o == null) {
-            return null;
-        } else if (Array.isArray(o)) {
-            return o.map(this._fromJSON);
-        } else if (typeof(o) == "object") {
-            if (Object.keys(o).length == 1 && typeof(o[uint8ArrayTag]) == 'string') {
-                return sodium.from_base64(o[uint8ArrayTag]);
-
-            } else if (Object.keys(o).length == 1 && typeof(o[hashTag]) == 'string') {
-                return new Hash(sodium.from_base64(o[hashTag]));
-
-            } else if (Object.keys(o).length == 1 && typeof(o[boxTag]) == 'string') {
-                return new Box(sodium.from_base64(o[boxTag]));
-
-            } else {
-                let r = {};
-                for (let k in o) {
-                    let v = o[k];
-
-                    k = this._fromJSON(k);
-                    v = this._fromJSON(v);
-
-                    r[k] = v;
-                }
-
-                return r;
-            }
-        } else {
-            return o;
-        }
-    }
-
     fromJSON(o) {
-        return this.verify(this._fromJSON(o));
+        return this.verify(_fromJSON(o));
     }
 
     fromSafeJSON(o) {
-        return this._fromJSON(o);
+        return _fromJSON(o);
     }
 
     toJSON(o) {
-        if (o == null) {
-            return null;
-        } else if (Array.isArray(o)) {
-            return o.map(this.toJSON);
-        } else if (typeof(o) == "object") {
-            if (o.constructor == Uint8Array) {
-                let r = {};
-                r[uint8ArrayTag] = sodium.to_base64(o);
-                return r;
-
-            } else if (o.constructor == Hash) {
-                let r = {};
-                r[hashTag] = sodium.to_base64(o._raw);
-                return r;
-
-            } else if (o.constructor == Box) {
-                let r = {};
-                r[boxTag] = sodium.to_base64(o._raw);
-                return r;
-
-            } else {
-                let r = {};
-                for (let k in o) {
-                    let v = o[k];
-
-                    k = this.toJSON(k);
-                    v = this.toJSON(v);
-
-                    r[k] = v;
-                }
-
-                return r;
-            }
-        } else {
-            return o;
-        }
+        return _toJSON(o);
     }
 
     fromToken(code) {
@@ -499,10 +472,15 @@ class Chain {
     toToken(o) {
         return JSON.stringify(this.toJSON(o));
     }
+
+    isSignature(o, type) {
+        return o.type == "anychain.signature" && o.body.type == type;
+    }
 };
 
 const Anychain = {
     Chain: Chain,
+    tokenMimeType: tokenMimeType,
 };
 
 (function() {
